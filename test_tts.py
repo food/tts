@@ -71,7 +71,7 @@ async def fake_azure(req):
 async def fake_edge(req):
     """Stand-in for Edge."""
     edge_got.append(req.input)
-    return b"ID3edge", "mp3", main.EDGE_VOICE
+    return silence(), "wav", main.EDGE_VOICE
 
 
 fake_azure.down = False
@@ -109,6 +109,35 @@ fake_azure.down = True
 r = speak(input="Ja", model="azure,edge")
 assert r.headers["x-engine"] == "edge" and len(spoken) == before, r.headers
 
+# --- spaces in the list are fine; a body ffmpeg cannot read moves on to the next engine
+fake_azure.down = False
+r = speak(input="x", model="azure, edge", response_format="opus")
+assert r.status_code == 200 and r.headers["x-engine"] == "edge", r.text
+fake_azure.down = True
+
+# --- Edge: an empty first stream gets the second try
+streams = [[], [{"type": "audio", "data": b"ID3"}]]
+
+
+class FakeCommunicate:
+    """edge_tts.Communicate replaying queued streams."""
+
+    def __init__(self, *args, **kwargs):
+        self.chunks = streams.pop(0)
+
+    async def stream(self):
+        """Yield the queued chunks."""
+        for c in self.chunks:
+            yield c
+
+
+main.ENGINES["edge"] = main.edge
+real_communicate, main.edge_tts.Communicate = main.edge_tts.Communicate, FakeCommunicate
+r = speak(input="x", model="edge")
+assert r.status_code == 200 and r.content == b"ID3" and not streams, r.text
+main.edge_tts.Communicate = real_communicate
+main.ENGINES["edge"] = fake_edge
+
 # --- everything down: 503 naming each engine
 main.ENGINES["edge"] = fake_azure
 r = speak(input="x", model="azure,edge")
@@ -125,6 +154,7 @@ assert [main.rate(s) for s in (1.1, 0.9, 1.0)] == ["+10%", "-10%", "+0%"]
 ssml = main.azure_ssml("AT&T <Q3>", "de-DE-SeraphinaMultilingualNeural", 1.1)
 assert "AT&amp;T &lt;Q3&gt;" in ssml and "<lang xml:lang='de-DE'>" in ssml, ssml
 assert "<lang" not in main.azure_ssml("Kalimera", "el-GR-AthinaNeural", 1.0)
+assert "xml:lang='fil-PH'" in main.azure_ssml("x", "fil-PH-AngeloNeural", 1.0)
 assert main.qwen_budget("a" * 10) == 240 and main.qwen_budget("a" * 9000) == 2400
 
 server.shutdown()

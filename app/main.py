@@ -4,6 +4,7 @@ import logging
 import os
 import subprocess
 from typing import Literal
+from urllib.parse import quote
 from xml.sax.saxutils import escape
 
 import edge_tts
@@ -80,7 +81,7 @@ async def qwen(req: Speech) -> tuple[bytes, str, str]:
 def azure_ssml(text: str, voice: str, speed: float) -> str:
     """SSML for Azure. Multilingual voices guess the language per sentence and read
     short German sentences in English unless <lang> pins the voice's own locale."""
-    locale = voice[:5]
+    locale = "-".join(voice.split("-")[:2])
     inner = f"<prosody rate='{rate(speed)}'>{escape(text)}</prosody>"
     if "Multilingual" in voice:
         inner = f"<lang xml:lang='{locale}'>{inner}</lang>"
@@ -120,10 +121,13 @@ async def edge(req: Speech) -> tuple[bytes, str, str]:
         return bytes(out)
 
     try:
-        return await asyncio.wait_for(collect(), EDGE_SECS), "mp3", voice
+        audio = await asyncio.wait_for(collect(), EDGE_SECS)
+        if audio:
+            return audio, "mp3", voice
+        log.warning("edge attempt 1 returned no audio")
     except Exception as e:
         log.warning("edge attempt 1 failed: %s", e)
-        return await asyncio.wait_for(collect(), EDGE_SECS), "mp3", voice
+    return await asyncio.wait_for(collect(), EDGE_SECS), "mp3", voice
 
 
 ENGINES = {"qwen": qwen, "azure": azure, "edge": edge}
@@ -140,7 +144,8 @@ def convert(audio: bytes, src: str, dst: str) -> bytes:
 @app.post("/v1/audio/speech")
 async def speech(req: Speech):
     """Try the engines in order; model is "auto" (TTS_CHAIN), one engine or a comma list."""
-    names = CHAIN if req.model in ("auto", "tts-1", "tts-1-hd") else req.model.split(",")
+    names = CHAIN if req.model in ("auto", "tts-1", "tts-1-hd") else [
+        n.strip() for n in req.model.split(",")]
     unknown = [n for n in names if n not in ENGINES]
     if unknown:
         raise HTTPException(400, f"unknown engine {unknown}, use auto or {sorted(ENGINES)}")
@@ -150,14 +155,15 @@ async def speech(req: Speech):
             audio, fmt, voice = await ENGINES[name](req)
             if not audio:
                 raise RuntimeError("empty audio")
+            # A broken body from one engine shows up here; the next engine still gets its turn.
+            audio = await asyncio.to_thread(convert, audio, fmt, req.response_format)
         except Exception as e:
             errors.append(f"{name}: {type(e).__name__}: {e}")
             log.warning("tts %s", errors[-1])
             continue
-        audio = await asyncio.to_thread(convert, audio, fmt, req.response_format)
         log.info("tts %s voice=%s chars=%d", name, voice, len(req.input))
         return Response(audio, media_type=MEDIA[req.response_format],
-                        headers={"X-Engine": name, "X-Voice": voice})
+                        headers={"X-Engine": name, "X-Voice": quote(voice)})
     raise HTTPException(503, "; ".join(errors))
 
 

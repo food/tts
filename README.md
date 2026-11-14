@@ -28,7 +28,7 @@ POST /v1/audio/speech
 | `speed` | 0.5 to 2.0, becomes the SSML rate for Azure and Edge. |
 | `device` | Optional routing hint passed to qwen3-tts, e.g. `gpu_if_free`. |
 
-The response is the audio. `X-Engine` and `X-Voice` say who spoke. If every
+The response is the audio. `X-Engine` and `X-Voice` (URL-encoded) say who spoke. If every
 engine fails the answer is 503 with each engine's error in `detail`.
 
 Any OpenAI client works:
