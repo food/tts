@@ -27,6 +27,8 @@ CHAIN = os.environ.get("TTS_CHAIN", "qwen,azure,edge").split(",")
 AZURE_MAX_CHARS = 9000
 # Longest wait for an engine's first audio chunk (qwen has its own budget).
 FIRST_CHUNK_SECS = 240
+# Cap on the rest of a non-streamed answer; edge_tts only limits each pause to 60 s.
+REST_SECS = 600
 MEDIA = {"mp3": "audio/mpeg", "opus": "audio/ogg", "wav": "audio/wav"}
 ENCODE = {"mp3": ["-c:a", "libmp3lame", "-b:a", "64k", "-f", "mp3"],
           "opus": ["-c:a", "libopus", "-b:a", "48k", "-f", "ogg"],
@@ -68,6 +70,11 @@ Audio = tuple[str, str, AsyncIterator[bytes]]  # format, voice, chunks
 async def once(data: bytes) -> AsyncIterator[bytes]:
     """A finished body as a one-chunk stream."""
     yield data
+
+
+async def collect(chunks: AsyncIterator[bytes]) -> list[bytes]:
+    """All remaining chunks of a stream."""
+    return [c async for c in chunks]
 
 
 async def qwen(req: Speech) -> Audio:
@@ -180,7 +187,8 @@ async def speech(req: Speech):
                 raise RuntimeError("empty audio")
             passthrough = req.stream and fmt == req.response_format
             if not passthrough:
-                audio = first + b"".join([c async for c in chunks])
+                audio = first + b"".join(
+                    await asyncio.wait_for(collect(chunks), REST_SECS))
                 # A broken body from one engine shows up here; the next engine still gets its turn.
                 audio = await asyncio.to_thread(convert, audio, fmt, req.response_format)
         except Exception as e:
@@ -194,9 +202,12 @@ async def speech(req: Speech):
         if passthrough:
             async def relay(first=first, rest=chunks) -> AsyncIterator[bytes]:
                 """The chunk that decided the engine, then the rest as it comes."""
-                yield first
-                async for c in rest:
-                    yield c
+                try:
+                    yield first
+                    async for c in rest:
+                        yield c
+                finally:
+                    await rest.aclose()  # a client that hangs up stops the engine too
 
             return StreamingResponse(relay(), media_type=MEDIA[fmt], headers=headers)
         return Response(audio, media_type=MEDIA[req.response_format], headers=headers)
