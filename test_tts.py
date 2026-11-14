@@ -67,13 +67,29 @@ async def fake_azure(req):
     azure_got.append(req.voice)
     if fake_azure.down:
         raise RuntimeError("HTTP 401")
-    return b"ID3azure", "mp3", req.voice or main.AZURE_VOICE
+    return "mp3", req.voice or main.AZURE_VOICE, main.once(b"ID3azure")
 
 
 async def fake_edge(req):
     """Stand-in for Edge."""
     edge_got.append(req.input)
-    return silence(), "wav", main.EDGE_VOICE
+    return "wav", main.EDGE_VOICE, main.once(silence())
+
+
+async def late_failure(req):
+    """An engine whose error only shows with the first chunk, like an Azure 429."""
+    async def chunks():
+        raise RuntimeError("HTTP 429")
+        yield b""
+    return "mp3", "de-DE-SeraphinaMultilingualNeural", chunks()
+
+
+async def mp3_chunks(req):
+    """An engine that sends its mp3 in three pieces."""
+    async def chunks():
+        for c in (b"ID3", b"-a", b"-b"):
+            yield c
+    return "mp3", main.EDGE_VOICE, chunks()
 
 
 fake_azure.down = False
@@ -146,6 +162,20 @@ r = speak(input="x", model="edge")
 assert r.status_code == 200 and r.content == b"ID3" and not streams, r.text
 main.edge_tts.Communicate = real_communicate
 main.ENGINES["edge"] = fake_edge
+
+# --- stream: an error with the first chunk moves on, the chosen engine's chunks pass through
+main.ENGINES.update(azure=late_failure, edge=mp3_chunks)
+with api.stream("POST", "/v1/audio/speech",
+                json={"input": "x", "model": "azure,edge", "stream": True}) as r:
+    assert r.status_code == 200 and r.headers["x-engine"] == "edge", r.headers
+    assert b"".join(r.iter_bytes()) == b"ID3-a-b"
+# without stream the same pieces come joined
+r = speak(input="x", model="edge")
+assert r.content == b"ID3-a-b" and "transfer-encoding" not in r.headers, r.headers
+# stream with a format the engine does not produce: converted, in one piece
+r = speak(input="x", model="qwen", stream=True)
+assert r.headers["x-engine"] == "qwen" and r.content[:3] in (b"ID3", b"\xff\xf3\x64"), r.content[:4]
+main.ENGINES.update(azure=fake_azure, edge=fake_edge)
 
 # --- everything down: 503 naming each engine
 main.ENGINES["edge"] = fake_azure
