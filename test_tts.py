@@ -4,6 +4,7 @@ import io
 import json
 import os
 import threading
+import time
 import wave
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -32,8 +33,9 @@ class Qwen(BaseHTTPRequestHandler):
         self.answer(json.dumps(health).encode(), "application/json")
 
     def do_POST(self):
-        """Record the request and answer with silence."""
+        """Record the request and answer with silence, after a delay if one is set."""
         spoken.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+        time.sleep(health.get("delay", 0))
         self.answer(silence(), "audio/wav", {"X-Voice": spoken[-1]["voice"]})
 
     def answer(self, body, ctype, extra=()):
@@ -97,6 +99,13 @@ health["default_voice_ready"] = False
 r = speak(input="x")
 assert r.headers["x-engine"] == "azure" and r.content == b"ID3azure", r.headers
 health["default_voice_ready"] = True
+
+# --- the caller's qwen_timeout replaces the length-based budget
+health["delay"] = 1.5
+r = speak(input="x", qwen_timeout=0.5)
+assert r.headers["x-engine"] == "azure", r.headers
+health["delay"] = 0
+assert speak(input="x", qwen_timeout=0).status_code == 422
 
 # --- a Microsoft voice never goes to qwen, Azure gets it as asked
 before = len(spoken)
