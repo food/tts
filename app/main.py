@@ -3,14 +3,14 @@ import asyncio
 import logging
 import os
 import subprocess
-from typing import Literal
+from typing import AsyncIterator, Literal
 from urllib.parse import quote
 from xml.sax.saxutils import escape
 
 import edge_tts
 import httpx
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 QWEN_URL = os.environ.get("QWEN_URL", "").rstrip("/")
@@ -25,7 +25,10 @@ CHAIN = os.environ.get("TTS_CHAIN", "qwen,azure,edge").split(",")
 
 # One Azure request returns at most 10 minutes of audio, roughly 9000 characters.
 AZURE_MAX_CHARS = 9000
-EDGE_SECS = 240
+# Longest wait for an engine's first audio chunk (qwen has its own budget).
+FIRST_CHUNK_SECS = 240
+# Cap on the rest of a non-streamed answer; edge_tts only limits each pause to 60 s.
+REST_SECS = 600
 MEDIA = {"mp3": "audio/mpeg", "opus": "audio/ogg", "wav": "audio/wav"}
 ENCODE = {"mp3": ["-c:a", "libmp3lame", "-b:a", "64k", "-f", "mp3"],
           "opus": ["-c:a", "libopus", "-b:a", "48k", "-f", "ogg"],
@@ -43,6 +46,7 @@ class Speech(BaseModel):
     speed: float = Field(1.0, ge=0.5, le=2.0)
     device: str | None = None  # qwen3-tts routing hint, e.g. "gpu_if_free"
     qwen_timeout: float | None = Field(None, gt=0, le=7200)  # overrides qwen_budget()
+    stream: bool = False  # pass audio on as it arrives, if no conversion is needed
 
 
 def microsoft_voice(voice: str | None) -> str | None:
@@ -60,7 +64,20 @@ def qwen_budget(text: str) -> float:
     return max(240, min(2400, 150 + 0.6 * len(text)))
 
 
-async def qwen(req: Speech) -> tuple[bytes, str, str]:
+Audio = tuple[str, str, AsyncIterator[bytes]]  # format, voice, chunks
+
+
+async def once(data: bytes) -> AsyncIterator[bytes]:
+    """A finished body as a one-chunk stream."""
+    yield data
+
+
+async def collect(chunks: AsyncIterator[bytes]) -> list[bytes]:
+    """All remaining chunks of a stream."""
+    return [c async for c in chunks]
+
+
+async def qwen(req: Speech) -> Audio:
     """Voice clone on the GPU box; the health check tells a stopped service apart quickly."""
     if not QWEN_URL:
         raise RuntimeError("QWEN_URL not set")
@@ -76,7 +93,7 @@ async def qwen(req: Speech) -> tuple[bytes, str, str]:
         r = await client.post(f"{QWEN_URL}/v1/audio/speak", json=body,
                               timeout=req.qwen_timeout or qwen_budget(req.input))
         r.raise_for_status()
-    return r.content, "wav", r.headers.get("x-voice", body["voice"])
+    return "wav", r.headers.get("x-voice", body["voice"]), once(r.content)
 
 
 def azure_ssml(text: str, voice: str, speed: float) -> str:
@@ -89,46 +106,56 @@ def azure_ssml(text: str, voice: str, speed: float) -> str:
     return f"<speak version='1.0' xml:lang='{locale}'><voice name='{voice}'>{inner}</voice></speak>"
 
 
-async def azure(req: Speech) -> tuple[bytes, str, str]:
+async def azure(req: Speech) -> Audio:
     """Azure Speech REST API (free tier F0, 500k characters a month)."""
     if not (AZURE_KEY and AZURE_REGION):
         raise RuntimeError("AZURE_SPEECH_KEY/AZURE_SPEECH_REGION not set")
     if len(req.input) > AZURE_MAX_CHARS:
         raise RuntimeError(f"text too long for one request ({len(req.input)} characters)")
     voice = microsoft_voice(req.voice) or AZURE_VOICE
-    async with httpx.AsyncClient() as client:
-        r = await client.post(
-            f"https://{AZURE_REGION}.tts.speech.microsoft.com/cognitiveservices/v1",
-            content=azure_ssml(req.input, voice, req.speed).encode(),
-            headers={"Ocp-Apim-Subscription-Key": AZURE_KEY,
-                     "Content-Type": "application/ssml+xml",
-                     "X-Microsoft-OutputFormat": "audio-24khz-48kbitrate-mono-mp3",
-                     "User-Agent": "tts"},
-            timeout=min(180, 30 + len(req.input) // 50))
-        r.raise_for_status()
-    return r.content, "mp3", voice
+
+    async def chunks() -> AsyncIterator[bytes]:
+        """The mp3 as Azure sends it; HTTP errors surface with the first chunk."""
+        async with httpx.AsyncClient() as client:
+            async with client.stream(
+                    "POST", f"https://{AZURE_REGION}.tts.speech.microsoft.com/cognitiveservices/v1",
+                    content=azure_ssml(req.input, voice, req.speed).encode(),
+                    headers={"Ocp-Apim-Subscription-Key": AZURE_KEY,
+                             "Content-Type": "application/ssml+xml",
+                             "X-Microsoft-OutputFormat": "audio-24khz-48kbitrate-mono-mp3",
+                             "User-Agent": "tts"},
+                    timeout=min(180, 30 + len(req.input) // 50)) as r:
+                r.raise_for_status()
+                async for b in r.aiter_bytes():
+                    yield b
+
+    return "mp3", voice, chunks()
 
 
-async def edge(req: Speech) -> tuple[bytes, str, str]:
-    """Edge read-aloud service. Roughly every fifth request fails, so it gets a second try."""
+async def edge(req: Speech) -> Audio:
+    """Edge read-aloud service. Roughly every fifth request fails, so it gets a second try
+    as long as nothing has been passed on yet."""
     voice = microsoft_voice(req.voice) or EDGE_VOICE
 
-    async def collect() -> bytes:
-        """Concatenate the audio chunks of one synthesis."""
-        out = bytearray()
-        async for chunk in edge_tts.Communicate(req.input, voice, rate=rate(req.speed)).stream():
-            if chunk["type"] == "audio":
-                out += chunk["data"]
-        return bytes(out)
+    async def chunks() -> AsyncIterator[bytes]:
+        """Audio chunks of the first attempt that delivers any."""
+        for attempt in (1, 2):
+            sent = False
+            try:
+                async for c in edge_tts.Communicate(req.input, voice, rate=rate(req.speed)).stream():
+                    if c["type"] == "audio":
+                        sent = True
+                        yield c["data"]
+            except Exception as e:
+                if sent or attempt == 2:
+                    raise
+                log.warning("edge attempt 1 failed: %s", e)
+                continue
+            if sent:
+                return
+            log.warning("edge attempt %d returned no audio", attempt)
 
-    try:
-        audio = await asyncio.wait_for(collect(), EDGE_SECS)
-        if audio:
-            return audio, "mp3", voice
-        log.warning("edge attempt 1 returned no audio")
-    except Exception as e:
-        log.warning("edge attempt 1 failed: %s", e)
-    return await asyncio.wait_for(collect(), EDGE_SECS), "mp3", voice
+    return "mp3", voice, chunks()
 
 
 ENGINES = {"qwen": qwen, "azure": azure, "edge": edge}
@@ -152,19 +179,38 @@ async def speech(req: Speech):
         raise HTTPException(400, f"unknown engine {unknown}, use auto or {sorted(ENGINES)}")
     errors = []
     for name in names:
+        chunks = None
         try:
-            audio, fmt, voice = await ENGINES[name](req)
-            if not audio:
+            fmt, voice, chunks = await ENGINES[name](req)
+            first = await asyncio.wait_for(anext(chunks, b""), FIRST_CHUNK_SECS)
+            if not first:
                 raise RuntimeError("empty audio")
-            # A broken body from one engine shows up here; the next engine still gets its turn.
-            audio = await asyncio.to_thread(convert, audio, fmt, req.response_format)
+            passthrough = req.stream and fmt == req.response_format
+            if not passthrough:
+                audio = first + b"".join(
+                    await asyncio.wait_for(collect(chunks), REST_SECS))
+                # A broken body from one engine shows up here; the next engine still gets its turn.
+                audio = await asyncio.to_thread(convert, audio, fmt, req.response_format)
         except Exception as e:
+            if chunks is not None:
+                await chunks.aclose()
             errors.append(f"{name}: {type(e).__name__}: {e}")
             log.warning("tts %s", errors[-1])
             continue
-        log.info("tts %s voice=%s chars=%d", name, voice, len(req.input))
-        return Response(audio, media_type=MEDIA[req.response_format],
-                        headers={"X-Engine": name, "X-Voice": quote(voice)})
+        log.info("tts %s voice=%s chars=%d stream=%s", name, voice, len(req.input), passthrough)
+        headers = {"X-Engine": name, "X-Voice": quote(voice)}
+        if passthrough:
+            async def relay(first=first, rest=chunks) -> AsyncIterator[bytes]:
+                """The chunk that decided the engine, then the rest as it comes."""
+                try:
+                    yield first
+                    async for c in rest:
+                        yield c
+                finally:
+                    await rest.aclose()  # a client that hangs up stops the engine too
+
+            return StreamingResponse(relay(), media_type=MEDIA[fmt], headers=headers)
+        return Response(audio, media_type=MEDIA[req.response_format], headers=headers)
     raise HTTPException(503, "; ".join(errors))
 
 

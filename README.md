@@ -28,6 +28,7 @@ POST /v1/audio/speech
 | `speed` | 0.5 to 2.0, becomes the SSML rate for Azure and Edge. |
 | `device` | Optional routing hint passed to qwen3-tts, e.g. `gpu_if_free`. |
 | `qwen_timeout` | Optional seconds to wait for qwen; default grows with the text from 240 to 2400. |
+| `stream` | `true` passes the audio on while it is generated. The engine is chosen with its first chunk, so a later failure cuts the audio short. Only when the engine already speaks `response_format` (Azure and Edge: mp3); otherwise the answer comes in one piece. |
 
 The response is the audio. `X-Engine` and `X-Voice` (URL-encoded) say who spoke. If every
 engine fails the answer is 503 with each engine's error in `detail`.
