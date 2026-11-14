@@ -79,6 +79,7 @@ async def fake_edge(req):
 async def late_failure(req):
     """An engine whose error only shows with the first chunk, like an Azure 429."""
     async def chunks():
+        """Fails before the first byte."""
         raise RuntimeError("HTTP 429")
         yield b""
     return "mp3", "de-DE-SeraphinaMultilingualNeural", chunks()
@@ -87,6 +88,7 @@ async def late_failure(req):
 async def mp3_chunks(req):
     """An engine that sends its mp3 in three pieces."""
     async def chunks():
+        """Three pieces of one mp3."""
         for c in (b"ID3", b"-a", b"-b"):
             yield c
     return "mp3", main.EDGE_VOICE, chunks()
