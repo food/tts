@@ -1,3 +1,5 @@
 fastapi
 uvicorn
-edge-tts
+httpx
+# 7.2.x gets 403 on the websocket since October 2026
+edge-tts>=7.3.1
