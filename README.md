@@ -27,6 +27,7 @@ POST /v1/audio/speech
 | `response_format` | `mp3` (default), `opus` (Ogg/Opus, what Telegram wants for voice notes) or `wav`. |
 | `speed` | 0.5 to 2.0, becomes the SSML rate for Azure and Edge. |
 | `device` | Optional routing hint passed to qwen3-tts, e.g. `gpu_if_free`. |
+| `qwen_timeout` | Optional seconds to wait for qwen; default grows with the text from 240 to 2400. |
 
 The response is the audio. `X-Engine` and `X-Voice` (URL-encoded) say who spoke. If every
 engine fails the answer is 503 with each engine's error in `detail`.

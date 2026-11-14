@@ -42,6 +42,7 @@ class Speech(BaseModel):
     response_format: Literal["mp3", "opus", "wav"] = "mp3"
     speed: float = Field(1.0, ge=0.5, le=2.0)
     device: str | None = None  # qwen3-tts routing hint, e.g. "gpu_if_free"
+    qwen_timeout: float | None = Field(None, gt=0, le=7200)  # overrides qwen_budget()
 
 
 def microsoft_voice(voice: str | None) -> str | None:
@@ -73,7 +74,7 @@ async def qwen(req: Speech) -> tuple[bytes, str, str]:
         if not health.get("default_voice_ready"):
             raise RuntimeError(f"not ready: {health}")
         r = await client.post(f"{QWEN_URL}/v1/audio/speak", json=body,
-                              timeout=qwen_budget(req.input))
+                              timeout=req.qwen_timeout or qwen_budget(req.input))
         r.raise_for_status()
     return r.content, "wav", r.headers.get("x-voice", body["voice"])
 
